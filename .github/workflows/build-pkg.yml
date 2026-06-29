@@ -8,84 +8,133 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Versão do pkg (ex: 01.00)'
+        description: 'Versão do app (ex: 01.00)'
         required: false
         default: '01.00'
 
 jobs:
   build-pkg:
-    name: Gerar fPKG para PS4
+    name: Compilar eboot.bin e gerar fPKG
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout do repositório ──────────────────────
-      - name: 📥 Checkout
+      # ── 1. Checkout ──────────────────────────────────────
+      - name: 📥 Checkout do repositório
         uses: actions/checkout@v4
 
-      # ── 2. Instalar dependências ────────────────────────
-      - name: 🔧 Instalar dependências
+      # ── 2. Python + Pillow ───────────────────────────────
+      - name: 🐍 Instalar Python e Pillow
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 python3-pip wget unzip curl
+          sudo apt-get install -y python3 python3-pip -qq
           pip3 install Pillow --quiet
 
-      # ── 3. Baixar PkgTool.Core (OpenOrbis) ─────────────
-      - name: 📦 Baixar PkgTool.Core
-        run: |
-          mkdir -p tools
-          # Baixar PkgTool.Core do OpenOrbis
-          wget -q "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest/download/linux-toolchain.zip" -O tools/toolchain.zip || true
-          # Fallback: baixar só o PkgTool.Core
-          wget -q "https://github.com/maxton/LibOrbisPkg/releases/latest/download/PkgTool.Core" -O tools/PkgTool.Core 2>/dev/null || true
-          # Alternativa com dotnet
-          if [ ! -f tools/PkgTool.Core ]; then
-            sudo apt-get install -y dotnet-runtime-7.0 2>/dev/null || sudo apt-get install -y dotnet-runtime-6.0 2>/dev/null || true
-            wget -q "https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip" -O tools/PkgTool.zip 2>/dev/null || true
-            if [ -f tools/PkgTool.zip ]; then unzip -q tools/PkgTool.zip -d tools/; fi
-          fi
-          chmod +x tools/PkgTool.Core 2>/dev/null || true
-          ls -la tools/
-
-      # ── 4. Gerar param.sfo + ícones ────────────────────
-      - name: 🎨 Gerar param.sfo e assets do pkg
+      # ── 3. Gerar param.sfo + ícones + copiar web files ──
+      - name: 🎨 Gerar assets do PKG
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           python3 pkg-tools/make_pkg_assets.py "$VERSION"
 
-      # ── 5. Criar arquivo .gp4 (projeto do pkg) ─────────
-      - name: 📋 Gerar pkg.gp4
+      # ── 4. OpenOrbis — compilar eboot.bin ───────────────
+      - name: 🔨 Compilar eboot.bin com OpenOrbis
+        uses: OpenOrbis/toolchain-action@main
+        with:
+          version: latest
+          command: |
+            make eboot
+            echo "[CI] eboot.bin gerado:"
+            ls -lh build/eboot.bin 2>/dev/null || echo "[WARN] eboot.bin não encontrado"
+
+      # ── 5. Verificar eboot.bin ───────────────────────────
+      - name: ✅ Verificar eboot.bin
+        run: |
+          if [ -f build/eboot.bin ]; then
+            echo "eboot.bin OK — $(du -sh build/eboot.bin | cut -f1)"
+          else
+            echo "::warning::eboot.bin não gerado — PKG será inválido!"
+          fi
+
+      # ── 6. Baixar PkgTool.Core ───────────────────────────
+      - name: 📦 Instalar PkgTool.Core
+        run: |
+          sudo apt-get install -y dotnet-runtime-8.0 2>/dev/null || \
+          sudo apt-get install -y dotnet-runtime-7.0 2>/dev/null || \
+          sudo apt-get install -y dotnet-runtime-6.0 2>/dev/null || true
+
+          mkdir -p tools
+
+          # Baixar LibOrbisPkg (PkgTool.Core)
+          RELEASE_URL="https://github.com/maxton/LibOrbisPkg/releases/latest/download"
+          wget -q "${RELEASE_URL}/PkgTool.Core.zip" -O tools/PkgTool.zip 2>/dev/null || \
+          wget -q "https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip" \
+               -O tools/PkgTool.zip 2>/dev/null || true
+
+          if [ -f tools/PkgTool.zip ]; then
+            unzip -q tools/PkgTool.zip -d tools/PkgTool/
+            echo "[OK] PkgTool.Core extraído:"
+            ls tools/PkgTool/
+          else
+            echo "[WARN] PkgTool.zip não baixado — usando builder Python"
+          fi
+
+      # ── 7. Gerar pkg.gp4 ────────────────────────────────
+      - name: 📋 Gerar arquivo pkg.gp4
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           python3 pkg-tools/make_gp4.py "$VERSION"
+          echo "[OK] pkg.gp4:"
+          cat pkg/pkg.gp4
 
-      # ── 6. Build do PKG ─────────────────────────────────
-      - name: 🔨 Build fPKG
+      # ── 8. Build do PKG com PkgTool.Core ────────────────
+      - name: 🔨 Build fPKG (PkgTool.Core)
         run: |
           mkdir -p output
-          # Tenta com PkgTool.Core nativo
-          if [ -f tools/PkgTool.Core ] && file tools/PkgTool.Core | grep -q "ELF"; then
-            ./tools/PkgTool.Core pkg_build pkg/pkg.gp4 output/
-          # Tenta com dotnet
-          elif [ -f tools/PkgTool.Core.dll ]; then
-            dotnet tools/PkgTool.Core.dll pkg_build pkg/pkg.gp4 output/
-          # Fallback: build manual via Python
-          else
-            echo "PkgTool não disponível, usando builder Python..."
+
+          # Tentar PkgTool.Core .NET
+          PKG_BUILT=0
+
+          if [ -d tools/PkgTool/ ]; then
+            PKGTOOL=$(find tools/PkgTool/ -name "PkgTool.Core*" -executable 2>/dev/null | head -1)
+            PKGTOOL_DLL=$(find tools/PkgTool/ -name "PkgTool.Core.dll" 2>/dev/null | head -1)
+
+            if [ -n "$PKGTOOL" ] && file "$PKGTOOL" | grep -q "ELF"; then
+              echo "[BUILD] Usando PkgTool.Core nativo..."
+              chmod +x "$PKGTOOL"
+              "$PKGTOOL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+
+            elif [ -n "$PKGTOOL_DLL" ] && command -v dotnet &>/dev/null; then
+              echo "[BUILD] Usando PkgTool.Core via dotnet..."
+              dotnet "$PKGTOOL_DLL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+            fi
+          fi
+
+          # Fallback Python se PkgTool falhar
+          if [ "$PKG_BUILT" -eq 0 ]; then
+            echo "[BUILD] Fallback: builder Python..."
             python3 pkg-tools/build_pkg.py
           fi
+
+          echo "[OUTPUT] Arquivos gerados:"
           ls -lh output/
 
-      # ── 7. Nomear o arquivo final ───────────────────────
-      - name: 📝 Renomear PKG
+      # ── 9. Renomear PKG ──────────────────────────────────
+      - name: 📝 Renomear PKG final
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
-          TAG="${{ github.ref_name }}"
-          PKG_NAME="UnitVPro_PS4_${TAG}_v${VERSION}.pkg"
-          find output/ -name "*.pkg" -exec mv {} "output/${PKG_NAME}" \; 2>/dev/null || true
+          REF="${{ github.ref_name }}"
+          SAFE_REF="${REF//\//-}"
+          NEW_NAME="UnitVPro_PS4_${SAFE_REF}_v${VERSION}.pkg"
+
+          # Renomear qualquer .pkg gerado
+          find output/ -name "*.pkg" | while read f; do
+            mv "$f" "output/${NEW_NAME}"
+            echo "[OK] PKG final: output/${NEW_NAME}"
+          done
+
           ls -lh output/
 
-      # ── 8. Upload como artefato de CI ──────────────────
-      - name: 📤 Upload Artefato
+      # ── 10. Upload artefato de CI ────────────────────────
+      - name: 📤 Upload PKG como artefato
         uses: actions/upload-artifact@v4
         with:
           name: UnitVPro-PS4-PKG
@@ -93,36 +142,42 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # ── 9. Criar Release (somente em tags v*) ──────────
+      # ── 11. Criar Release (somente em tags v*) ───────────
       - name: 🚀 Criar GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: output/*.pkg
-          name: "UnitV Pro PS4 ${{ github.ref_name }}"
+          name: "🎮 UnitV Pro PS4 ${{ github.ref_name }}"
           body: |
-            ## 🎮 UnitV Pro — Versão PS4
+            ## 🎮 UnitV Pro — App IPTV para PS4
 
-            ### Como instalar:
+            ### ⬇️ Como instalar
             1. Baixe o arquivo `.pkg` abaixo
-            2. Coloque na raiz de um USB **exFAT**
-            3. No PS4: `GoldHEN → Debug Settings → Package Installer`
+            2. Copie para a **raiz** de um pendrive **exFAT**
+            3. No PS4 com GoldHEN: `Debug Settings → Package Installer`
             4. Selecione e instale
 
-            ### Requisitos:
-            - PS4 com **GoldHEN** instalado
-            - Firmware compatível (até 11.00)
-            - Conexão com internet para uso do app
+            ### 📋 Detalhes do build
+            | Campo | Valor |
+            |-------|-------|
+            | Title ID | `UNITV0001` |
+            | Versão | `${{ github.ref_name }}` |
+            | Build | [Actions #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-            ### Controles:
+            ### 🕹️ Controles
             | Botão | Ação |
             |-------|------|
             | D-Pad | Navegar |
-            | X (Cruz) | Confirmar |
-            | O (Bola) | Voltar |
-            | □ (Quadrado) | Favoritar |
-            | △ (Triângulo) | Buscar |
-            | L1 / R1 | Trocar aba |
+            | X | Confirmar |
+            | O | Voltar |
+            | □ | Favoritar |
+            | △ | Buscar |
+            | L1/R1 | Trocar aba |
+
+            ### ⚠️ Requisitos
+            - PS4 com **GoldHEN** (firmware ≤ 11.00)
+            - Conexão com internet
           draft: false
           prerelease: false
         env:
