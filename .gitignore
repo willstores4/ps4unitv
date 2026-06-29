@@ -1,0 +1,30 @@
+# UnitV Pro PS4 — Arquivos ignorados pelo Git
+
+# Node / npm
+node_modules/
+npm-debug.log*
+
+# Build temporário
+pkg/
+output/
+tools/
+*.zip
+*.tar.gz
+
+# Apenas o param.sfo na sce_sys é versionado
+# (os outros são gerados no CI)
+sce_sys/*.sfo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
