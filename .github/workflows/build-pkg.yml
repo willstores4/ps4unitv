@@ -1,0 +1,129 @@
+name: 🎮 Build PS4 PKG
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão do pkg (ex: 01.00)'
+        required: false
+        default: '01.00'
+
+jobs:
+  build-pkg:
+    name: Gerar fPKG para PS4
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout do repositório ──────────────────────
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Instalar dependências ────────────────────────
+      - name: 🔧 Instalar dependências
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-pip wget unzip curl
+          pip3 install Pillow --quiet
+
+      # ── 3. Baixar PkgTool.Core (OpenOrbis) ─────────────
+      - name: 📦 Baixar PkgTool.Core
+        run: |
+          mkdir -p tools
+          # Baixar PkgTool.Core do OpenOrbis
+          wget -q "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest/download/linux-toolchain.zip" -O tools/toolchain.zip || true
+          # Fallback: baixar só o PkgTool.Core
+          wget -q "https://github.com/maxton/LibOrbisPkg/releases/latest/download/PkgTool.Core" -O tools/PkgTool.Core 2>/dev/null || true
+          # Alternativa com dotnet
+          if [ ! -f tools/PkgTool.Core ]; then
+            sudo apt-get install -y dotnet-runtime-7.0 2>/dev/null || sudo apt-get install -y dotnet-runtime-6.0 2>/dev/null || true
+            wget -q "https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip" -O tools/PkgTool.zip 2>/dev/null || true
+            if [ -f tools/PkgTool.zip ]; then unzip -q tools/PkgTool.zip -d tools/; fi
+          fi
+          chmod +x tools/PkgTool.Core 2>/dev/null || true
+          ls -la tools/
+
+      # ── 4. Gerar param.sfo + ícones ────────────────────
+      - name: 🎨 Gerar param.sfo e assets do pkg
+        run: |
+          VERSION="${{ github.event.inputs.version || '01.00' }}"
+          python3 pkg-tools/make_pkg_assets.py "$VERSION"
+
+      # ── 5. Criar arquivo .gp4 (projeto do pkg) ─────────
+      - name: 📋 Gerar pkg.gp4
+        run: |
+          VERSION="${{ github.event.inputs.version || '01.00' }}"
+          python3 pkg-tools/make_gp4.py "$VERSION"
+
+      # ── 6. Build do PKG ─────────────────────────────────
+      - name: 🔨 Build fPKG
+        run: |
+          mkdir -p output
+          # Tenta com PkgTool.Core nativo
+          if [ -f tools/PkgTool.Core ] && file tools/PkgTool.Core | grep -q "ELF"; then
+            ./tools/PkgTool.Core pkg_build pkg/pkg.gp4 output/
+          # Tenta com dotnet
+          elif [ -f tools/PkgTool.Core.dll ]; then
+            dotnet tools/PkgTool.Core.dll pkg_build pkg/pkg.gp4 output/
+          # Fallback: build manual via Python
+          else
+            echo "PkgTool não disponível, usando builder Python..."
+            python3 pkg-tools/build_pkg.py
+          fi
+          ls -lh output/
+
+      # ── 7. Nomear o arquivo final ───────────────────────
+      - name: 📝 Renomear PKG
+        run: |
+          VERSION="${{ github.event.inputs.version || '01.00' }}"
+          TAG="${{ github.ref_name }}"
+          PKG_NAME="UnitVPro_PS4_${TAG}_v${VERSION}.pkg"
+          find output/ -name "*.pkg" -exec mv {} "output/${PKG_NAME}" \; 2>/dev/null || true
+          ls -lh output/
+
+      # ── 8. Upload como artefato de CI ──────────────────
+      - name: 📤 Upload Artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnitVPro-PS4-PKG
+          path: output/*.pkg
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 9. Criar Release (somente em tags v*) ──────────
+      - name: 🚀 Criar GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/*.pkg
+          name: "UnitV Pro PS4 ${{ github.ref_name }}"
+          body: |
+            ## 🎮 UnitV Pro — Versão PS4
+
+            ### Como instalar:
+            1. Baixe o arquivo `.pkg` abaixo
+            2. Coloque na raiz de um USB **exFAT**
+            3. No PS4: `GoldHEN → Debug Settings → Package Installer`
+            4. Selecione e instale
+
+            ### Requisitos:
+            - PS4 com **GoldHEN** instalado
+            - Firmware compatível (até 11.00)
+            - Conexão com internet para uso do app
+
+            ### Controles:
+            | Botão | Ação |
+            |-------|------|
+            | D-Pad | Navegar |
+            | X (Cruz) | Confirmar |
+            | O (Bola) | Voltar |
+            | □ (Quadrado) | Favoritar |
+            | △ (Triângulo) | Buscar |
+            | L1 / R1 | Trocar aba |
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
