@@ -173,25 +173,48 @@ jobs:
 
           echo "[OK] UnitVPro.elf ($(du -h build/UnitVPro.elf | cut -f1))"
 
-          # ── Converter ELF → eboot.bin ─────────────────────────
+          # ── Localizar create-eboot (verifica bin/, bin/linux/, extra/) ──────
           CREATE_EBOOT=""
-          [ -n "$TOOLCHAIN" ] && \
-            CREATE_EBOOT=$(find "$TOOLCHAIN" -name "create-eboot" -type f 2>/dev/null | head -1)
+          if [ -n "$TOOLCHAIN" ]; then
+            echo "[SELF] Procurando create-eboot em $TOOLCHAIN..."
+            # bin/linux/ é onde o OpenOrbis coloca os binários Linux
+            for SEARCH_DIR in "$TOOLCHAIN/bin/linux" "$TOOLCHAIN/bin" "$TOOLCHAIN/extra" "$TOOLCHAIN"; do
+              if [ -d "$SEARCH_DIR" ]; then
+                FOUND=$(find "$SEARCH_DIR" -maxdepth 2 -name "create-eboot" -type f 2>/dev/null | head -1)
+                if [ -n "$FOUND" ]; then
+                  CREATE_EBOOT="$FOUND"
+                  echo "[SELF] Encontrado: $CREATE_EBOOT"
+                  break
+                fi
+              fi
+            done
 
-          if [ -n "$CREATE_EBOOT" ] && [ -x "$CREATE_EBOOT" ]; then
+            # Listar bin/linux para diagnóstico
+            echo "[SELF] Conteúdo de $TOOLCHAIN/bin/linux/:"
+            ls "$TOOLCHAIN/bin/linux/" 2>/dev/null || echo "  (não existe)"
+            echo "[SELF] Conteúdo de $TOOLCHAIN/bin/:"
+            ls "$TOOLCHAIN/bin/" 2>/dev/null | head -20 || echo "  (não existe)"
+          fi
+
+          if [ -n "$CREATE_EBOOT" ]; then
+            chmod +x "$CREATE_EBOOT"
+            echo "[SELF] Executando: $CREATE_EBOOT"
             "$CREATE_EBOOT" \
               -in="build/UnitVPro.elf" \
               -out="build/eboot.bin" \
               -titleid="UNITV0001" \
               -paid=0x3800000000000011
-            echo "[OK] eboot.bin via create-eboot"
+            echo "[OK] eboot.bin (SELF format) via create-eboot: $(du -h build/eboot.bin | cut -f1)"
+            file build/eboot.bin
           else
-            echo "[WARN] create-eboot não encontrado — usando ELF diretamente"
+            echo "[WARN] create-eboot NÃO encontrado!"
+            echo "[WARN] Copiando ELF como eboot.bin (PKG pode ser inválido)"
             cp build/UnitVPro.elf build/eboot.bin
           fi
 
-          echo "[BUILD] Resultado:"
+          echo "[BUILD] Arquivos finais:"
           ls -lh build/
+          file build/eboot.bin
 
 
       # ── 5. Gerar assets (param.sfo + ícones + web files) ─
@@ -236,35 +259,57 @@ jobs:
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           python3 pkg-tools/make_gp4.py "$VERSION"
 
-      # ── 8. Build do PKG ──────────────────────────────────
+      # ── 8. Build do PKG ──────────────────────────────────────────────
       - name: 🔨 Build fPKG
         run: |
           mkdir -p output
           PKG_BUILT=0
 
-          # Tentar PkgTool.Core .dll via dotnet
-          PKGTOOL_DLL=$(find tools/pkgtool -name "PkgTool.Core.dll" 2>/dev/null | head -1)
-          if [ -n "$PKGTOOL_DLL" ] && command -v dotnet &>/dev/null; then
-            echo "[BUILD] Usando PkgTool.Core via dotnet..."
-            dotnet "$PKGTOOL_DLL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+          # ─ Diagnóstico: listar conteúdo de tools/pkgtool
+          echo "[PKG] Conteúdo de tools/pkgtool/:"
+          ls -lh tools/pkgtool/ 2>/dev/null || echo "  (vazio)"
+
+          # ─ Tentar executável nativo linux-x64 (self-contained, sem dotnet)
+          # O binário se chama 'PkgTool.Core' depois da extração
+          PKGTOOL_EXE=$(find tools/pkgtool -maxdepth 2 -type f -name "PkgTool.Core" 2>/dev/null | head -1)
+          if [ -z "$PKGTOOL_EXE" ]; then
+            # Qualquer binário que não seja .dll/.json/.pdb
+            PKGTOOL_EXE=$(find tools/pkgtool -maxdepth 2 -type f \
+              ! -name "*.dll" ! -name "*.json" ! -name "*.pdb" ! -name "*.xml" \
+              2>/dev/null | head -1)
           fi
 
-          # Tentar executável nativo
+          if [ -n "$PKGTOOL_EXE" ]; then
+            chmod +x "$PKGTOOL_EXE"
+            echo "[PKG] Executando: $PKGTOOL_EXE pkg_build pkg/pkg.gp4 output/"
+            "$PKGTOOL_EXE" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+            echo "[PKG] Exit code: $?"
+          fi
+
+          # ─ Tentar via dotnet se existir .dll
           if [ "$PKG_BUILT" -eq 0 ]; then
-            PKGTOOL_EXE=$(find tools/pkgtool -type f -not -name "*.dll" -not -name "*.xml" 2>/dev/null | head -1)
-            if [ -n "$PKGTOOL_EXE" ]; then
-              chmod +x "$PKGTOOL_EXE" 2>/dev/null
-              "$PKGTOOL_EXE" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+            PKGTOOL_DLL=$(find tools/pkgtool -name "PkgTool.Core.dll" 2>/dev/null | head -1)
+            if [ -n "$PKGTOOL_DLL" ] && command -v dotnet &>/dev/null; then
+              echo "[PKG] Usando PkgTool.Core via dotnet: $PKGTOOL_DLL"
+              dotnet "$PKGTOOL_DLL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
             fi
           fi
 
-          # Fallback Python
-          if [ "$PKG_BUILT" -eq 0 ]; then
-            echo "[BUILD] Usando builder Python como fallback..."
+          # ─ Resultado
+          echo "[PKG] PKG_BUILT=$PKG_BUILT"
+          if [ "$PKG_BUILT" -eq 1 ]; then
+            echo "[OK] PKG criado por PkgTool.Core:"
+            ls -lh output/
+            file output/*.pkg 2>/dev/null || true
+          else
+            echo "[WARN] PkgTool.Core não funcionou!"
+            echo "[WARN] O PKG gerado será inválido no PS4."
+            echo "[INFO] Verifique o log de download do PkgTool no step anterior."
+            # Gera placeholder para que o artifact seja criado
             python3 pkg-tools/build_pkg.py
           fi
 
-          echo "[OUTPUT] Resultado:"
+          echo "[OUTPUT] Arquivos em output/:"
           ls -lh output/
 
       # ── 9. Renomear PKG ──────────────────────────────────
