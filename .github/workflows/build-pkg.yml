@@ -135,27 +135,41 @@ jobs:
             LDFLAGS="$LDFLAGS --script $TOOLCHAIN/link.x"
           fi
 
-          # libs do PS4 — listar o que está disponível e linkar apenas o que existe
+          # libs do PS4 — usar os nomes reais conforme ls do toolchain
           if [ -n "$TOOLCHAIN" ]; then
             LDFLAGS="$LDFLAGS -L$TOOLCHAIN/lib"
             [ -f "$TOOLCHAIN/lib/crt1.o" ] && LDFLAGS="$LDFLAGS $TOOLCHAIN/lib/crt1.o"
 
-            echo "[LINK] Bibliotecas disponíveis em $TOOLCHAIN/lib:"
-            ls "$TOOLCHAIN/lib/"*.a 2>/dev/null | xargs -I{} basename {} .a | sort
+            echo "[LINK] Bibliotecas em $TOOLCHAIN/lib:"
+            ls "$TOOLCHAIN/lib/" 2>/dev/null | head -30
 
-            # Linkar somente libs que existem
-            for LIB in SceLibcInternal kernel ScePthread SceSystemService SceNet; do
+            # ── Libs PS4 específicas (stubs .so ou .a)
+            for LIB in SceLibcInternal kernel SceSystemService; do
               if ls "$TOOLCHAIN/lib/"*${LIB}* 2>/dev/null | grep -q .; then
                 LDFLAGS="$LDFLAGS -l${LIB}"
                 echo "[LINK] + -l${LIB}"
               else
-                echo "[LINK] skip -l${LIB} (não encontrado)"
+                echo "[LINK] skip -l${LIB}"
               fi
             done
+
+            # ── libc: necessária para __libc_start_main (disponível como libc.a)
+            if [ -f "$TOOLCHAIN/lib/libc.a" ]; then
+              LDFLAGS="$LDFLAGS -lc"
+              echo "[LINK] + -lc (para __libc_start_main)"
+            fi
+
+            # ── Builtins do clang (para operações de FP e outros internals)
+            BUILTINS=$(ls "$TOOLCHAIN/lib/libclang_rt.builtins"*.a 2>/dev/null | head -1)
+            if [ -n "$BUILTINS" ]; then
+              LDFLAGS="$LDFLAGS $BUILTINS"
+              echo "[LINK] + $BUILTINS"
+            fi
           fi
 
-          echo "[LINK] LDFLAGS: $LDFLAGS"
+          echo "[LINK] LDFLAGS final: $LDFLAGS"
           $LLD $LDFLAGS build/main.o -o build/UnitVPro.elf
+
 
           echo "[OK] UnitVPro.elf ($(du -h build/UnitVPro.elf | cut -f1))"
 
