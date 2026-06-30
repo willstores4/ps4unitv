@@ -205,24 +205,29 @@ jobs:
           find pkg/USRDIR/web -name "*.html" -o -name "*.js" 2>/dev/null | head -10
 
       # ── 6. Baixar PkgTool.Core ───────────────────────────
-      - name: 📦 Baixar PkgTool.Core (LibOrbisPkg)
+      - name: 📦 Baixar PkgTool.Core (LibOrbisPkg Linux)
         run: |
           mkdir -p tools/pkgtool
 
-          # Instalar .NET runtime
-          sudo apt-get install -y dotnet-runtime-8.0 2>/dev/null || \
-          sudo apt-get install -y dotnet-runtime-6.0 2>/dev/null || true
+          # URL CORRETA (confirmada via GitHub API — release v0.2, asset linux-x64)
+          # Nome real do asset: PkgTool.Core-linux-x64-0.2.231.zip
+          PKGTOOL_URL="https://github.com/maxton/LibOrbisPkg/releases/download/v0.2/PkgTool.Core-linux-x64-0.2.231.zip"
 
-          # Baixar PkgTool.Core
-          PKGTOOL_URL="https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip"
-          wget -q "$PKGTOOL_URL" -O tools/PkgTool.zip 2>/dev/null || true
+          echo "[PKG] Baixando PkgTool.Core Linux x64..."
+          wget -q "$PKGTOOL_URL" -O tools/PkgTool.zip
 
-          if [ -f tools/PkgTool.zip ]; then
+          # Verificar se é um zip válido
+          if file tools/PkgTool.zip | grep -q "Zip archive"; then
             unzip -q tools/PkgTool.zip -d tools/pkgtool/
             echo "[OK] PkgTool.Core extraído:"
-            ls tools/pkgtool/
+            ls -lh tools/pkgtool/
+            # Tornar executável
+            find tools/pkgtool/ -name "PkgTool*" -not -name "*.dll" -not -name "*.json" \
+              -exec chmod +x {} \; 2>/dev/null || true
           else
-            echo "[WARN] PkgTool.Core não disponível"
+            echo "[WARN] Download inválido ($(du -h tools/PkgTool.zip | cut -f1))"
+            echo "[WARN] Usando builder Python como fallback"
+            rm -f tools/PkgTool.zip
           fi
 
       # ── 7. Gerar pkg.gp4 ────────────────────────────────
