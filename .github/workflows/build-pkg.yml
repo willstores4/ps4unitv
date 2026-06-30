@@ -19,102 +19,174 @@ jobs:
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────
-      - name: 📥 Checkout do repositório
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python + Pillow ───────────────────────────────
-      - name: 🐍 Instalar Python e Pillow
+      # ── 2. Dependências base ─────────────────────────────
+      - name: 🔧 Instalar dependências
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 python3-pip -qq
+          sudo apt-get install -y \
+            python3 python3-pip \
+            clang lld \
+            wget curl unzip tar \
+            make -qq
           pip3 install Pillow --quiet
 
-      # ── 3. Gerar param.sfo + ícones + copiar web files ──
-      - name: 🎨 Gerar assets do PKG
+      # ── 3. Instalar OpenOrbis Toolchain v0.5.4 ──────────
+      - name: 🎮 Instalar OpenOrbis Toolchain
+        run: |
+          echo "[TOOLCHAIN] Baixando OpenOrbis v0.5.4..."
+          mkdir -p /opt/openorbis
+
+          # Asset oficial: toolchain-llvm-18.tar.gz
+          wget -q \
+            "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz" \
+            -O /tmp/openorbis.tar.gz
+
+          echo "[TOOLCHAIN] Extraindo..."
+          tar -xzf /tmp/openorbis.tar.gz -C /opt/openorbis --strip-components=1 2>/dev/null || \
+          tar -xzf /tmp/openorbis.tar.gz -C /opt/openorbis
+
+          echo "[TOOLCHAIN] Estrutura:"
+          ls /opt/openorbis/
+
+          # Tornar binários executáveis
+          find /opt/openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
+
+          # Exportar variável de ambiente
+          echo "OO_PS4_TOOLCHAIN=/opt/openorbis" >> $GITHUB_ENV
+          echo "[OK] OO_PS4_TOOLCHAIN=/opt/openorbis"
+
+      # ── 4. Compilar eboot.bin ────────────────────────────
+      - name: 🔨 Compilar eboot.bin
+        env:
+          OO_PS4_TOOLCHAIN: /opt/openorbis
+        run: |
+          echo "[BUILD] Compilando main.c para PS4..."
+          mkdir -p build
+
+          # Verificar toolchain
+          CLANG_PS4=$(find /opt/openorbis -name "clang" -o -name "clang-18" 2>/dev/null | head -1)
+          if [ -z "$CLANG_PS4" ]; then
+            echo "[WARN] clang do OpenOrbis não encontrado, usando clang do sistema..."
+            CLANG_PS4=clang
+          fi
+          echo "[BUILD] Usando compilador: $CLANG_PS4"
+
+          # Flags de compilação para PS4 x86_64-freebsd
+          CFLAGS="-cc1 -triple x86_64-pc-freebsd-elf \
+            -munwind-tables -fuse-init-array \
+            -builtin-headers-in-system-modules \
+            -O2 -target-feature +sse4.2 \
+            -I/opt/openorbis/include \
+            -I/opt/openorbis/include/c++/v1 \
+            -x c"
+
+          # Compilar para objeto
+          $CLANG_PS4 $CFLAGS src/main.c -emit-obj -o build/main.o
+          echo "[OK] main.o compilado"
+
+          # Linkar com lld
+          LDFLAGS="-m elf_x86_64 -pie \
+            --eh-frame-hdr \
+            -L/opt/openorbis/lib \
+            /opt/openorbis/lib/crt1.o \
+            -lSceLibcInternal -lkernel \
+            -lScePthread -lSceSystemService -lSceUserService"
+
+          if [ -f /opt/openorbis/link.x ]; then
+            LDFLAGS="--script /opt/openorbis/link.x $LDFLAGS"
+          fi
+
+          ld.lld $LDFLAGS build/main.o -o build/UnitVPro.elf
+          echo "[OK] UnitVPro.elf gerado"
+
+          # Converter ELF → eboot.bin
+          CREATE_EBOOT=$(find /opt/openorbis -name "create-eboot" 2>/dev/null | head -1)
+          if [ -n "$CREATE_EBOOT" ]; then
+            chmod +x "$CREATE_EBOOT"
+            "$CREATE_EBOOT" \
+              -in="build/UnitVPro.elf" \
+              -out="build/eboot.bin" \
+              -titleid="UNITV0001" \
+              -paid=0x3800000000000011
+            echo "[OK] eboot.bin criado via create-eboot"
+          else
+            # Fallback: usar objcopy para criar eboot.bin mínimo
+            echo "[WARN] create-eboot não encontrado — usando llvm-objcopy"
+            llvm-objcopy --output-target=binary build/UnitVPro.elf build/eboot.bin 2>/dev/null || \
+            cp build/UnitVPro.elf build/eboot.bin
+          fi
+
+          ls -lh build/
+
+      # ── 5. Gerar assets (param.sfo + ícones + web files) ─
+      - name: 🎨 Gerar param.sfo, ícones e copiar web app
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           python3 pkg-tools/make_pkg_assets.py "$VERSION"
-
-      # ── 4. OpenOrbis — compilar eboot.bin ───────────────
-      - name: 🔨 Compilar eboot.bin com OpenOrbis
-        uses: OpenOrbis/toolchain-action@main
-        with:
-          version: latest
-          command: |
-            make eboot
-            echo "[CI] eboot.bin gerado:"
-            ls -lh build/eboot.bin 2>/dev/null || echo "[WARN] eboot.bin não encontrado"
-
-      # ── 5. Verificar eboot.bin ───────────────────────────
-      - name: ✅ Verificar eboot.bin
-        run: |
-          if [ -f build/eboot.bin ]; then
-            echo "eboot.bin OK — $(du -sh build/eboot.bin | cut -f1)"
-          else
-            echo "::warning::eboot.bin não gerado — PKG será inválido!"
-          fi
+          echo "[OK] Assets gerados:"
+          ls -lh pkg/sce_sys/ 2>/dev/null || true
+          echo "[OK] Web files:"
+          find pkg/USRDIR/web -name "*.html" -o -name "*.js" 2>/dev/null | head -10
 
       # ── 6. Baixar PkgTool.Core ───────────────────────────
-      - name: 📦 Instalar PkgTool.Core
+      - name: 📦 Baixar PkgTool.Core (LibOrbisPkg)
         run: |
+          mkdir -p tools/pkgtool
+
+          # Instalar .NET runtime
           sudo apt-get install -y dotnet-runtime-8.0 2>/dev/null || \
-          sudo apt-get install -y dotnet-runtime-7.0 2>/dev/null || \
           sudo apt-get install -y dotnet-runtime-6.0 2>/dev/null || true
 
-          mkdir -p tools
-
-          # Baixar LibOrbisPkg (PkgTool.Core)
-          RELEASE_URL="https://github.com/maxton/LibOrbisPkg/releases/latest/download"
-          wget -q "${RELEASE_URL}/PkgTool.Core.zip" -O tools/PkgTool.zip 2>/dev/null || \
-          wget -q "https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip" \
-               -O tools/PkgTool.zip 2>/dev/null || true
+          # Baixar PkgTool.Core
+          PKGTOOL_URL="https://github.com/maxton/LibOrbisPkg/releases/download/v0.6/PkgTool.Core.zip"
+          wget -q "$PKGTOOL_URL" -O tools/PkgTool.zip 2>/dev/null || true
 
           if [ -f tools/PkgTool.zip ]; then
-            unzip -q tools/PkgTool.zip -d tools/PkgTool/
+            unzip -q tools/PkgTool.zip -d tools/pkgtool/
             echo "[OK] PkgTool.Core extraído:"
-            ls tools/PkgTool/
+            ls tools/pkgtool/
           else
-            echo "[WARN] PkgTool.zip não baixado — usando builder Python"
+            echo "[WARN] PkgTool.Core não disponível"
           fi
 
       # ── 7. Gerar pkg.gp4 ────────────────────────────────
-      - name: 📋 Gerar arquivo pkg.gp4
+      - name: 📋 Gerar pkg.gp4
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           python3 pkg-tools/make_gp4.py "$VERSION"
-          echo "[OK] pkg.gp4:"
-          cat pkg/pkg.gp4
 
-      # ── 8. Build do PKG com PkgTool.Core ────────────────
-      - name: 🔨 Build fPKG (PkgTool.Core)
+      # ── 8. Build do PKG ──────────────────────────────────
+      - name: 🔨 Build fPKG
         run: |
           mkdir -p output
-
-          # Tentar PkgTool.Core .NET
           PKG_BUILT=0
 
-          if [ -d tools/PkgTool/ ]; then
-            PKGTOOL=$(find tools/PkgTool/ -name "PkgTool.Core*" -executable 2>/dev/null | head -1)
-            PKGTOOL_DLL=$(find tools/PkgTool/ -name "PkgTool.Core.dll" 2>/dev/null | head -1)
+          # Tentar PkgTool.Core .dll via dotnet
+          PKGTOOL_DLL=$(find tools/pkgtool -name "PkgTool.Core.dll" 2>/dev/null | head -1)
+          if [ -n "$PKGTOOL_DLL" ] && command -v dotnet &>/dev/null; then
+            echo "[BUILD] Usando PkgTool.Core via dotnet..."
+            dotnet "$PKGTOOL_DLL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+          fi
 
-            if [ -n "$PKGTOOL" ] && file "$PKGTOOL" | grep -q "ELF"; then
-              echo "[BUILD] Usando PkgTool.Core nativo..."
-              chmod +x "$PKGTOOL"
-              "$PKGTOOL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
-
-            elif [ -n "$PKGTOOL_DLL" ] && command -v dotnet &>/dev/null; then
-              echo "[BUILD] Usando PkgTool.Core via dotnet..."
-              dotnet "$PKGTOOL_DLL" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
+          # Tentar executável nativo
+          if [ "$PKG_BUILT" -eq 0 ]; then
+            PKGTOOL_EXE=$(find tools/pkgtool -type f -not -name "*.dll" -not -name "*.xml" 2>/dev/null | head -1)
+            if [ -n "$PKGTOOL_EXE" ]; then
+              chmod +x "$PKGTOOL_EXE" 2>/dev/null
+              "$PKGTOOL_EXE" pkg_build pkg/pkg.gp4 output/ && PKG_BUILT=1
             fi
           fi
 
-          # Fallback Python se PkgTool falhar
+          # Fallback Python
           if [ "$PKG_BUILT" -eq 0 ]; then
-            echo "[BUILD] Fallback: builder Python..."
+            echo "[BUILD] Usando builder Python como fallback..."
             python3 pkg-tools/build_pkg.py
           fi
 
-          echo "[OUTPUT] Arquivos gerados:"
+          echo "[OUTPUT] Resultado:"
           ls -lh output/
 
       # ── 9. Renomear PKG ──────────────────────────────────
@@ -122,19 +194,13 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version || '01.00' }}"
           REF="${{ github.ref_name }}"
-          SAFE_REF="${REF//\//-}"
-          NEW_NAME="UnitVPro_PS4_${SAFE_REF}_v${VERSION}.pkg"
-
-          # Renomear qualquer .pkg gerado
-          find output/ -name "*.pkg" | while read f; do
-            mv "$f" "output/${NEW_NAME}"
-            echo "[OK] PKG final: output/${NEW_NAME}"
-          done
-
+          NAME="UnitVPro_PS4_${REF}_v${VERSION}.pkg"
+          find output/ -name "*.pkg" -exec mv {} "output/${NAME}" \; 2>/dev/null || true
+          echo "[OK] PKG final:"
           ls -lh output/
 
-      # ── 10. Upload artefato de CI ────────────────────────
-      - name: 📤 Upload PKG como artefato
+      # ── 10. Upload artefato ──────────────────────────────
+      - name: 📤 Upload PKG
         uses: actions/upload-artifact@v4
         with:
           name: UnitVPro-PS4-PKG
@@ -142,7 +208,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # ── 11. Criar Release (somente em tags v*) ───────────
+      # ── 11. GitHub Release (somente tags v*) ─────────────
       - name: 🚀 Criar GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -158,26 +224,23 @@ jobs:
             3. No PS4 com GoldHEN: `Debug Settings → Package Installer`
             4. Selecione e instale
 
-            ### 📋 Detalhes do build
             | Campo | Valor |
             |-------|-------|
             | Title ID | `UNITV0001` |
             | Versão | `${{ github.ref_name }}` |
-            | Build | [Actions #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+            | Build | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
             ### 🕹️ Controles
             | Botão | Ação |
             |-------|------|
             | D-Pad | Navegar |
-            | X | Confirmar |
-            | O | Voltar |
-            | □ | Favoritar |
-            | △ | Buscar |
-            | L1/R1 | Trocar aba |
+            | X (Cruz) | Confirmar |
+            | O (Bola) | Voltar |
+            | □ Quadrado | Favoritar |
+            | △ Triângulo | Buscar |
+            | L1 / R1 | Trocar aba |
 
-            ### ⚠️ Requisitos
-            - PS4 com **GoldHEN** (firmware ≤ 11.00)
-            - Conexão com internet
+            > ⚠️ Requer PS4 com **GoldHEN** e conexão com internet.
           draft: false
           prerelease: false
         env:
