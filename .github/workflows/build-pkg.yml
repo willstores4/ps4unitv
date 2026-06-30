@@ -44,19 +44,36 @@ jobs:
             "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz" \
             -O /tmp/openorbis.tar.gz
 
-          echo "[TOOLCHAIN] Extraindo..."
-          tar -xzf /tmp/openorbis.tar.gz -C /opt/openorbis --strip-components=1 2>/dev/null || \
+          # Inspecionar estrutura do tar antes de extrair
+          echo "[TOOLCHAIN] Estrutura do arquivo:"
+          tar -tzf /tmp/openorbis.tar.gz | head -30
+
+          # Detectar profundidade do diretório raiz
+          ROOT_DIR=$(tar -tzf /tmp/openorbis.tar.gz | head -1 | cut -d/ -f1)
+          echo "[TOOLCHAIN] Diretório raiz: $ROOT_DIR"
+
           tar -xzf /tmp/openorbis.tar.gz -C /opt/openorbis
 
-          echo "[TOOLCHAIN] Estrutura:"
+          # Normalizar: se extraiu para subpasta, mover para raiz
+          if [ -d "/opt/openorbis/$ROOT_DIR" ] && [ "$ROOT_DIR" != "." ]; then
+            mv /opt/openorbis/$ROOT_DIR/* /opt/openorbis/ 2>/dev/null || true
+            mv /opt/openorbis/$ROOT_DIR/.[!.]* /opt/openorbis/ 2>/dev/null || true
+            rmdir /opt/openorbis/$ROOT_DIR 2>/dev/null || true
+          fi
+
+          echo "[TOOLCHAIN] Conteúdo final:"
           ls /opt/openorbis/
 
           # Tornar binários executáveis
-          find /opt/openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
+          find /opt/openorbis -type f \( -name "clang*" -o -name "create-eboot" -o -name "ld.lld" \) \
+            -exec chmod +x {} \; 2>/dev/null || true
 
-          # Exportar variável de ambiente
+          # Localizar clang
+          CLANG_FOUND=$(find /opt/openorbis -name "clang" -o -name "clang-18" 2>/dev/null | head -1)
+          echo "[TOOLCHAIN] clang encontrado: ${CLANG_FOUND:-NÃO ENCONTRADO}"
+
           echo "OO_PS4_TOOLCHAIN=/opt/openorbis" >> $GITHUB_ENV
-          echo "[OK] OO_PS4_TOOLCHAIN=/opt/openorbis"
+          echo "[OK] Toolchain pronto"
 
       # ── 4. Compilar eboot.bin ────────────────────────────
       - name: 🔨 Compilar eboot.bin
@@ -66,56 +83,67 @@ jobs:
           echo "[BUILD] Compilando main.c para PS4..."
           mkdir -p build
 
-          # Verificar toolchain
-          CLANG_PS4=$(find /opt/openorbis -name "clang" -o -name "clang-18" 2>/dev/null | head -1)
-          if [ -z "$CLANG_PS4" ]; then
-            echo "[WARN] clang do OpenOrbis não encontrado, usando clang do sistema..."
-            CLANG_PS4=clang
+          # Localizar clang do OpenOrbis (prioridade) ou usar o do sistema
+          CLANG_PS4=$(find /opt/openorbis -name "clang" -type f 2>/dev/null | head -1)
+          CLANG_PS4=${CLANG_PS4:-$(find /opt/openorbis -name "clang-18" -type f 2>/dev/null | head -1)}
+          if [ -z "$CLANG_PS4" ] || [ ! -x "$CLANG_PS4" ]; then
+            echo "[WARN] clang do OpenOrbis não encontrado — usando clang do sistema"
+            CLANG_PS4=$(command -v clang-18 || command -v clang-17 || command -v clang)
           fi
-          echo "[BUILD] Usando compilador: $CLANG_PS4"
+          echo "[BUILD] Compilador: $CLANG_PS4"
+          $CLANG_PS4 --version | head -1
 
-          # Flags de compilação para PS4 x86_64-freebsd
-          CFLAGS="-cc1 -triple x86_64-pc-freebsd-elf \
-            -munwind-tables -fuse-init-array \
-            -builtin-headers-in-system-modules \
-            -O2 -target-feature +sse4.2 \
-            -I/opt/openorbis/include \
-            -I/opt/openorbis/include/c++/v1 \
-            -x c"
+          # Localizar include do OpenOrbis
+          ORBIS_INC=$(find /opt/openorbis -type d -name "orbis" 2>/dev/null | head -1)
+          ORBIS_INC=$(dirname "$ORBIS_INC" 2>/dev/null)
+          echo "[BUILD] Include: $ORBIS_INC"
 
-          # Compilar para objeto
-          $CLANG_PS4 $CFLAGS src/main.c -emit-obj -o build/main.o
+          # ── Flags normais de frontend clang (sem -cc1) ──
+          CFLAGS="--target=x86_64-pc-freebsd12 \
+            -fuse-init-array \
+            -fPIE \
+            -O2 \
+            -msse4.2 \
+            -nostdlib"
+
+          if [ -n "$ORBIS_INC" ]; then
+            CFLAGS="$CFLAGS -I$ORBIS_INC -I/opt/openorbis/include/c++/v1 -nostdinc"
+          fi
+
+          # Compilar
+          $CLANG_PS4 $CFLAGS -c src/main.c -o build/main.o
           echo "[OK] main.o compilado"
 
-          # Linkar com lld
-          LDFLAGS="-m elf_x86_64 -pie \
-            --eh-frame-hdr \
-            -L/opt/openorbis/lib \
-            /opt/openorbis/lib/crt1.o \
-            -lSceLibcInternal -lkernel \
-            -lScePthread -lSceSystemService -lSceUserService"
+          # Linkar com ld.lld
+          LLD=$(command -v ld.lld-18 || command -v ld.lld)
+          echo "[LINK] linker: $LLD"
 
+          LDFLAGS="-m elf_x86_64 -pie --eh-frame-hdr"
           if [ -f /opt/openorbis/link.x ]; then
-            LDFLAGS="--script /opt/openorbis/link.x $LDFLAGS"
+            LDFLAGS="$LDFLAGS --script /opt/openorbis/link.x"
+          fi
+          LDFLAGS="$LDFLAGS -L/opt/openorbis/lib"
+
+          if [ -f /opt/openorbis/lib/crt1.o ]; then
+            LDFLAGS="$LDFLAGS /opt/openorbis/lib/crt1.o"
           fi
 
-          ld.lld $LDFLAGS build/main.o -o build/UnitVPro.elf
+          LDFLAGS="$LDFLAGS -lSceLibcInternal -lkernel -lScePthread -lSceSystemService -lSceUserService"
+
+          $LLD $LDFLAGS build/main.o -o build/UnitVPro.elf
           echo "[OK] UnitVPro.elf gerado"
 
           # Converter ELF → eboot.bin
-          CREATE_EBOOT=$(find /opt/openorbis -name "create-eboot" 2>/dev/null | head -1)
-          if [ -n "$CREATE_EBOOT" ]; then
-            chmod +x "$CREATE_EBOOT"
+          CREATE_EBOOT=$(find /opt/openorbis -name "create-eboot" -type f 2>/dev/null | head -1)
+          if [ -n "$CREATE_EBOOT" ] && [ -x "$CREATE_EBOOT" ]; then
             "$CREATE_EBOOT" \
               -in="build/UnitVPro.elf" \
               -out="build/eboot.bin" \
               -titleid="UNITV0001" \
               -paid=0x3800000000000011
-            echo "[OK] eboot.bin criado via create-eboot"
+            echo "[OK] eboot.bin via create-eboot"
           else
-            # Fallback: usar objcopy para criar eboot.bin mínimo
-            echo "[WARN] create-eboot não encontrado — usando llvm-objcopy"
-            llvm-objcopy --output-target=binary build/UnitVPro.elf build/eboot.bin 2>/dev/null || \
+            echo "[WARN] create-eboot não encontrado — copiando ELF como eboot.bin"
             cp build/UnitVPro.elf build/eboot.bin
           fi
 
