@@ -77,64 +77,81 @@ jobs:
 
       # ── 4. Compilar eboot.bin ────────────────────────────
       - name: 🔨 Compilar eboot.bin
-        env:
-          OO_PS4_TOOLCHAIN: /opt/openorbis
         run: |
           echo "[BUILD] Compilando main.c para PS4..."
           mkdir -p build
 
-          # Localizar clang do OpenOrbis (prioridade) ou usar o do sistema
-          CLANG_PS4=$(find /opt/openorbis -name "clang" -type f 2>/dev/null | head -1)
-          CLANG_PS4=${CLANG_PS4:-$(find /opt/openorbis -name "clang-18" -type f 2>/dev/null | head -1)}
-          if [ -z "$CLANG_PS4" ] || [ ! -x "$CLANG_PS4" ]; then
-            echo "[WARN] clang do OpenOrbis não encontrado — usando clang do sistema"
-            CLANG_PS4=$(command -v clang-18 || command -v clang-17 || command -v clang)
+          # ── Detectar path real do toolchain ──────────────────
+          # O tar extrai para /opt/openorbis/PS4Toolchain/ (subpasta)
+          TOOLCHAIN=""
+          for p in \
+              /opt/openorbis/PS4Toolchain \
+              /opt/openorbis \
+              /opt/openorbis/openorbis-ps4-toolchain; do
+            if [ -d "$p/include/orbis" ]; then
+              TOOLCHAIN="$p"
+              break
+            fi
+          done
+          # Fallback: busca pelo diretório que contém include/orbis
+          if [ -z "$TOOLCHAIN" ]; then
+            TOOLCHAIN=$(find /opt/openorbis -type d -name "orbis" 2>/dev/null \
+                        | sed 's|/orbis$||' | sed 's|/include$||' | head -1)
           fi
-          echo "[BUILD] Compilador: $CLANG_PS4"
-          $CLANG_PS4 --version | head -1
+          echo "[BUILD] Toolchain detectado: $TOOLCHAIN"
+          echo "[BUILD] Conteúdo: $(ls $TOOLCHAIN 2>/dev/null | tr '\n' ' ')"
 
-          # Localizar include do OpenOrbis
-          ORBIS_INC=$(find /opt/openorbis -type d -name "orbis" 2>/dev/null | head -1)
-          ORBIS_INC=$(dirname "$ORBIS_INC" 2>/dev/null)
-          echo "[BUILD] Include: $ORBIS_INC"
+          # ── Compilador ────────────────────────────────────────
+          # Usar clang do sistema (OpenOrbis v0.5.4 não inclui clang próprio)
+          CLANG=$(command -v clang-18 || command -v clang-17 || command -v clang)
+          echo "[BUILD] Compilador: $CLANG ($($CLANG --version | head -1))"
 
-          # ── Flags normais de frontend clang (sem -cc1) ──
-          CFLAGS="--target=x86_64-pc-freebsd12 \
-            -fuse-init-array \
-            -fPIE \
-            -O2 \
-            -msse4.2 \
-            -nostdlib"
+          # ── Flags de compilação ───────────────────────────────
+          CFLAGS="--target=x86_64-pc-freebsd12"
+          CFLAGS="$CFLAGS -fuse-init-array -fPIE -O2 -msse4.2"
+          CFLAGS="$CFLAGS -nostdinc -nostdlib"
 
-          if [ -n "$ORBIS_INC" ]; then
-            CFLAGS="$CFLAGS -I$ORBIS_INC -I/opt/openorbis/include/c++/v1 -nostdinc"
+          # Headers do OpenOrbis
+          if [ -n "$TOOLCHAIN" ]; then
+            CFLAGS="$CFLAGS -I$TOOLCHAIN/include"
+            # C++ stdlib headers (se existir)
+            [ -d "$TOOLCHAIN/include/c++/v1" ] && CFLAGS="$CFLAGS -I$TOOLCHAIN/include/c++/v1"
           fi
 
-          # Compilar
-          $CLANG_PS4 $CFLAGS -c src/main.c -o build/main.o
-          echo "[OK] main.o compilado"
+          echo "[BUILD] CFLAGS: $CFLAGS"
 
-          # Linkar com ld.lld
+          # ── Compilar ─────────────────────────────────────────
+          $CLANG $CFLAGS -c src/main.c -o build/main.o
+          echo "[OK] main.o compilado ($(du -h build/main.o | cut -f1))"
+
+          # ── Linkar ───────────────────────────────────────────
           LLD=$(command -v ld.lld-18 || command -v ld.lld)
           echo "[LINK] linker: $LLD"
 
           LDFLAGS="-m elf_x86_64 -pie --eh-frame-hdr"
-          if [ -f /opt/openorbis/link.x ]; then
-            LDFLAGS="$LDFLAGS --script /opt/openorbis/link.x"
-          fi
-          LDFLAGS="$LDFLAGS -L/opt/openorbis/lib"
 
-          if [ -f /opt/openorbis/lib/crt1.o ]; then
-            LDFLAGS="$LDFLAGS /opt/openorbis/lib/crt1.o"
+          # linker script (se existir)
+          if [ -n "$TOOLCHAIN" ] && [ -f "$TOOLCHAIN/link.x" ]; then
+            LDFLAGS="$LDFLAGS --script $TOOLCHAIN/link.x"
           fi
 
-          LDFLAGS="$LDFLAGS -lSceLibcInternal -lkernel -lScePthread -lSceSystemService -lSceUserService"
+          # libs do PS4
+          if [ -n "$TOOLCHAIN" ]; then
+            LDFLAGS="$LDFLAGS -L$TOOLCHAIN/lib"
+            [ -f "$TOOLCHAIN/lib/crt1.o" ] && LDFLAGS="$LDFLAGS $TOOLCHAIN/lib/crt1.o"
+          fi
 
+          LDFLAGS="$LDFLAGS -lSceLibcInternal -lkernel -lScePthread -lSceSystemService"
+
+          echo "[LINK] LDFLAGS: $LDFLAGS"
           $LLD $LDFLAGS build/main.o -o build/UnitVPro.elf
-          echo "[OK] UnitVPro.elf gerado"
+          echo "[OK] UnitVPro.elf ($(du -h build/UnitVPro.elf | cut -f1))"
 
-          # Converter ELF → eboot.bin
-          CREATE_EBOOT=$(find /opt/openorbis -name "create-eboot" -type f 2>/dev/null | head -1)
+          # ── Converter ELF → eboot.bin ─────────────────────────
+          CREATE_EBOOT=""
+          [ -n "$TOOLCHAIN" ] && \
+            CREATE_EBOOT=$(find "$TOOLCHAIN" -name "create-eboot" -type f 2>/dev/null | head -1)
+
           if [ -n "$CREATE_EBOOT" ] && [ -x "$CREATE_EBOOT" ]; then
             "$CREATE_EBOOT" \
               -in="build/UnitVPro.elf" \
@@ -143,11 +160,13 @@ jobs:
               -paid=0x3800000000000011
             echo "[OK] eboot.bin via create-eboot"
           else
-            echo "[WARN] create-eboot não encontrado — copiando ELF como eboot.bin"
+            echo "[WARN] create-eboot não encontrado — usando ELF diretamente"
             cp build/UnitVPro.elf build/eboot.bin
           fi
 
+          echo "[BUILD] Resultado:"
           ls -lh build/
+
 
       # ── 5. Gerar assets (param.sfo + ícones + web files) ─
       - name: 🎨 Gerar param.sfo, ícones e copiar web app
