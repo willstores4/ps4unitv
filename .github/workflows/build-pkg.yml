@@ -135,16 +135,28 @@ jobs:
             LDFLAGS="$LDFLAGS --script $TOOLCHAIN/link.x"
           fi
 
-          # libs do PS4
+          # libs do PS4 — listar o que está disponível e linkar apenas o que existe
           if [ -n "$TOOLCHAIN" ]; then
             LDFLAGS="$LDFLAGS -L$TOOLCHAIN/lib"
             [ -f "$TOOLCHAIN/lib/crt1.o" ] && LDFLAGS="$LDFLAGS $TOOLCHAIN/lib/crt1.o"
-          fi
 
-          LDFLAGS="$LDFLAGS -lSceLibcInternal -lkernel -lScePthread -lSceSystemService"
+            echo "[LINK] Bibliotecas disponíveis em $TOOLCHAIN/lib:"
+            ls "$TOOLCHAIN/lib/"*.a 2>/dev/null | xargs -I{} basename {} .a | sort
+
+            # Linkar somente libs que existem
+            for LIB in SceLibcInternal kernel ScePthread SceSystemService SceNet; do
+              if ls "$TOOLCHAIN/lib/"*${LIB}* 2>/dev/null | grep -q .; then
+                LDFLAGS="$LDFLAGS -l${LIB}"
+                echo "[LINK] + -l${LIB}"
+              else
+                echo "[LINK] skip -l${LIB} (não encontrado)"
+              fi
+            done
+          fi
 
           echo "[LINK] LDFLAGS: $LDFLAGS"
           $LLD $LDFLAGS build/main.o -o build/UnitVPro.elf
+
           echo "[OK] UnitVPro.elf ($(du -h build/UnitVPro.elf | cut -f1))"
 
           # ── Converter ELF → eboot.bin ─────────────────────────
